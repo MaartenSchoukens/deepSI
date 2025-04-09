@@ -41,48 +41,71 @@ def past_future_arrays(data : Input_output_data | list, na : int, nb : int, T : 
     - ids (np.ndarray): Indices for valid data samples, adjusted to avoid overlap when data is a list of datasets.
     '''
 
-    if T=='sim':
-        if isinstance(data, (tuple,list)):
-            assert all(len(data[0])==len(d) for d in data), "if T='sim' then all given datasets need to have the same lenght (you should create the arrays in for loop instead)"
-            T = len(data[0]) - max(na, nb)
+    # Exception handling for list of Input_output_data objects instead of a singular Input_output_data object
+    if isinstance(data, (tuple,list)):
+        u_past_full = y_past_full = u_future_full = y_future_full = sampling_time = torch.FloatTensor()
+        ids_full = np.array([])
+        past_dim = 0
+        for set in data:
+            (u_past_set, y_past_set, u_future_set, y_future_set), ids_set = past_future_arrays(set, na=na, nb=nb, T=T, stride=stride, add_sampling_time=False)
+            u_past_full = torch.concat((u_past_full, u_past_set), dim=0)
+            y_past_full = torch.concat((y_past_full, y_past_set), dim=0)
+            u_future_full = torch.concat((u_future_full, u_future_set), dim=0)
+            y_future_full = torch.concat((y_future_full, y_future_set), dim=0)
+            ids_full = np.concat((ids_full, past_dim+ids_set)).astype(int)
+            past_dim += int(set.u.shape[0])
+            if add_sampling_time:
+                sampling_time_set = set.sampling_time*torch.ones(u_past_set.shape[0])
+                # NB: This approach takes the single provided value for the sampling time present in the data and set it as constant throughout the dataset.
+                sampling_time =  torch.concat((sampling_time, sampling_time_set), dim=0)
+        if add_sampling_time:
+            return (u_past_full, y_past_full, u_future_full, sampling_time, y_future_full), ids_full
         else:
-            T = len(data) - max(na, nb)
+            return (u_past_full, y_past_full, u_future_full, y_future_full), ids_full
+
+    # Compute number of possible windows
+    n_samples = len(data.u)
+    if T=="sim":    # Use full length of the input data
+        n_windows = 1
+        T = n_samples-max(na, nb)
+    else:
+        n_windows = int((n_samples-max(na, nb)-T)/stride + 1)
     
-    if isinstance(data, (tuple,list)):
-        u, y = np.concatenate([di.u for di in data], dtype=np.float32), np.concatenate([di.y for di in data], dtype=np.float32) #this always creates a copy
+    # Check whether assumptions are met
+    assert len(data.u) == len(data.y), "Input_output_data should contain input and output data of the same length."
+    assert nb + T <= len(data.u), "Timewindow can not be longer than the dataset"
+    assert na + T <= len(data.y), "Timewindow can not be longer than the dataset"
+
+    # Create tensors in dimension [n_windows, time_steps] for the single input case or [n_windows, time_steps, n_states] for the multi input case
+    u = torch.as_tensor(data.u)
+    if len(u.shape) == 1: # Single input
+        u_past = torch.as_strided(u[:-T], size=(n_windows, nb), stride=(stride, 1))
+        u_future = torch.as_strided(u[nb:], size=(n_windows, T), stride=(stride, 1))
+    else:   # Multiple inputs
+        u_dim = u.shape[1]
+        u_past = torch.as_strided(u[:-T, :], size=(n_windows, nb, u_dim), stride=(stride*u_dim, u_dim, 1))
+        u_future = torch.as_strided(u[nb:, :], size=(n_windows, T, u_dim), stride=(stride*u_dim, u_dim, 1))
+
+    # Create tensors in dimension [n_windows, time_steps] for the single output case or [n_windows, time_steps, n_states] for the multi output case
+    y = torch.as_tensor(data.y)
+    if len(u.shape) == 1: # Single input
+        y_past = torch.as_strided(y[:-T], size=(n_windows, na), stride=(stride, 1))
+        y_future = torch.as_strided(y[na:], size=(n_windows, T), stride=(stride, 1))
+    else:   # Multiple inputs
+        y_dim = u.shape[1]  
+        y_past = torch.as_strided(y[:-T, :], size=(n_windows, na, y_dim), stride=(stride*y_dim, y_dim, 1))
+        y_future = torch.as_strided(y[na:, :], size=(n_windows, T, y_dim), stride=(stride*y_dim, y_dim, 1))         
+    
+    # Create numpy array for the ids
+    ids = np.arange(0, n_windows*stride, stride)
+
+    # Add sampling_time tensor:
+    if add_sampling_time: 
+        sampling_time = data.sampling_time*torch.ones(n_windows)
+        # NB: This approach takes the single provided value for the sampling time present in the data and set it as constant throughout the dataset.
+        return (u_past, y_past, u_future, sampling_time, y_future), ids
     else:
-        u, y = data.u.astype(np.float32, copy=False), data.y.astype(np.float32, copy=False)
-
-    def window(x,window_shape=T): 
-        x = np.lib.stride_tricks.sliding_window_view(x, window_shape=window_shape,axis=0, writeable=True) #this windowing function does not increase the amount of data used.
-        s = (0,len(x.shape)-1) + tuple(range(1,len(x.shape)-1))
-        return x.transpose(s)
-
-    npast = max(na, nb)
-    ufuture = window(u[npast:len(u)], window_shape=T)
-    yfuture = window(y[npast:len(y)], window_shape=T)
-    upast = window(u[npast-nb:len(u)-T], window_shape=nb)
-    ypast = window(y[npast-na:len(y)-T], window_shape=na)
-
-    if isinstance(data, (tuple,list)):
-        acc_L, ids = 0, []
-        for d in data:
-            assert len(d.u)>=npast+T, f'some dataset was shorter than the length required by {max(na,nb)+T=} {len(d.u)=}'
-            ids.append(np.arange(0,len(d.u)-npast-T+1, stride) + acc_L) #only add ids which are valid for training (no overlap between the different datasets)
-            acc_L += len(d.u)
-        ids = np.concatenate(ids)
-    else:
-        ids = np.arange(0, len(data)-npast-T+1, stride)
-
-    s = torch.as_tensor
-    if not add_sampling_time:
-        return (s(upast), s(ypast), s(ufuture), s(yfuture)), ids #this could return all the valid indicies
-    else:
-        if isinstance(data, (tuple,list)):
-            sampling_time = torch.cat([torch.as_tensor(d.sampling_time,dtype=torch.float32)*torch.ones(len(d)) for d in data])[:len(upast)]
-        else:
-            sampling_time = torch.as_tensor(data.sampling_time,dtype=torch.float32)*torch.ones(len(upast))
-        return (s(upast), s(ypast), s(ufuture), sampling_time, s(yfuture)), ids
+        return (u_past, y_past, u_future, y_future), ids
 
 def validate_SUBNET_structure(model):
     nx, nu, ny, na, nb = model.nx, model.nu, model.ny, model.na, model.nb
